@@ -68,6 +68,7 @@
 #include "app_util_platform.h"
 #include "bsp_btn_ble.h"
 #include "nrf_pwr_mgmt.h"
+#include "nrf_drv_saadc.h"
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -103,13 +104,18 @@
 
 #define UART_TX_BUF_SIZE                256                                         /**< UART TX buffer size. */
 #define UART_RX_BUF_SIZE                256                                         /**< UART RX buffer size. */
+#define SAMPLES_IN_BUFFER               1    
+#define BATTERY_LEVEL_MEAS_INTERVAL     APP_TIMER_TICKS(1000)
 
 
 BLE_NUS_DEF(m_nus, NRF_SDH_BLE_TOTAL_LINK_COUNT);                                   /**< BLE NUS service instance. */
 NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
 NRF_BLE_QWR_DEF(m_qwr);                                                             /**< Context for the Queued Write module.*/
 BLE_ADVERTISING_DEF(m_advertising);                                                 /**< Advertising module instance. */
+APP_TIMER_DEF(m_battery_timer_id);                                                  /**< Battery measurement timer. */
 
+static nrf_saadc_value_t       adc_buf[2][SAMPLES_IN_BUFFER];
+static uint32_t                m_adc_evt_counter = 1;
 static uint16_t   m_conn_handle          = BLE_CONN_HANDLE_INVALID;                 /**< Handle of the current connection. */
 static uint16_t   m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;            /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
 static ble_uuid_t m_adv_uuids[]          =                                          /**< Universally unique service identifier. */
@@ -134,11 +140,67 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
 }
 
+void saadc_event_handler(nrf_drv_saadc_evt_t const * p_event)
+{   
+    float val; 
+    if (p_event->type == NRF_DRV_SAADC_EVT_DONE)
+    {
+        ret_code_t err_code;
+			//设置好缓存，为下次转换预备缓冲
+     err_code = nrf_drv_saadc_buffer_convert(p_event->data.done.p_buffer, SAMPLES_IN_BUFFER);
+        APP_ERROR_CHECK(err_code);
+
+        int i;
+        printf("ADC event number: %d\r\n",(int)m_adc_evt_counter);
+        for (i = 0; i < SAMPLES_IN_BUFFER; i++)
+        {
+					  val = p_event->data.done.p_buffer[i] * 3.6 /1024;	
+					printf("Battery level:%.2f mV\r\n",val*1000);
+        }
+        m_adc_evt_counter++;
+    }
+}
+
+//ADC配置
+static void adc_configure(void)
+{
+    ret_code_t err_code = nrf_drv_saadc_init(NULL, saadc_event_handler);//saadc的初始化
+    APP_ERROR_CHECK(err_code);
+
+    nrf_saadc_channel_config_t config =
+        NRF_DRV_SAADC_DEFAULT_CHANNEL_CONFIG_SE(NRF_SAADC_INPUT_VDD);//直接接内部VDD
+    err_code = nrf_drv_saadc_channel_init(0, &config);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = nrf_drv_saadc_buffer_convert(adc_buf[0], SAMPLES_IN_BUFFER);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = nrf_drv_saadc_buffer_convert(adc_buf[1], SAMPLES_IN_BUFFER);//用双缓冲采集
+    APP_ERROR_CHECK(err_code);
+}
+
+//定时时间到后，开始采集adc
+static void battery_level_meas_timeout_handler(void * p_context)
+{
+    UNUSED_PARAMETER(p_context);
+
+    ret_code_t err_code;
+    err_code = nrf_drv_saadc_sample();
+	
+    APP_ERROR_CHECK(err_code);
+}
+
 /**@brief Function for initializing the timer module.
  */
 static void timers_init(void)
 {
-    ret_code_t err_code = app_timer_init();
+    ret_code_t err_code;
+    err_code = app_timer_init();
+    APP_ERROR_CHECK(err_code);
+    // Create battery timer.
+    err_code = app_timer_create(&m_battery_timer_id,
+                                APP_TIMER_MODE_REPEATED,
+                                battery_level_meas_timeout_handler);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -504,6 +566,21 @@ void bsp_event_handler(bsp_event_t event)
                 }
             }
             break;
+						
+         case BSP_EVENT_KEY_3:            
+             nrf_gpio_pin_toggle(LED_4);
+				     err_code = app_timer_start(m_battery_timer_id, BATTERY_LEVEL_MEAS_INTERVAL, NULL);
+             APP_ERROR_CHECK(err_code);
+				     printf("Start the collection:\r\n");
+						 break;
+				 
+         case BSP_EVENT_KEY_2:            
+             nrf_gpio_pin_toggle(LED_4);
+				     err_code = app_timer_stop(m_battery_timer_id);
+             APP_ERROR_CHECK(err_code);
+				     printf("Stop the collection!\r\n");
+				     m_adc_evt_counter = 1;
+						 break; 
 
         default:
             break;
@@ -710,6 +787,7 @@ int main(void)
     services_init();
     advertising_init();
     conn_params_init();
+    adc_configure();
 
     // Start execution.
     printf("\r\nUART started.\r\n");
